@@ -1,7 +1,5 @@
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers } = require('@whiskeysockets/baileys');
 const fs = require('fs');
-const path = require('path');
-const QRCode = require('qrcode');
 
 // Use /tmp for auth storage on Render
 const authPath = '/tmp/auth_info';
@@ -16,42 +14,19 @@ async function connectToWhatsApp() {
     
     const sock = makeWASocket({
         auth: state,
-        printQRInTerminal: true,
+        printQRInTerminal: true, // Uses Baileys' built-in QR code display
         browser: Browsers.macOS('Desktop')
     });
 
-    sock.ev.on('connection.update', async (update) => {
+    sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
         
-        // Generate QR code as base64 when available
+        // Add clear instructions for scanning the QR code
         if (qr) {
-            console.log('QR code received. Generating base64 string...');
-            try {
-                // Generate QR code as base64 string
-                const qrBase64 = await QRCode.toDataURL(qr);
-                
-                // Output in a format that's easy to copy from logs
-                console.log('\n\n=== QR CODE BASE64 - COPY EVERYTHING BETWEEN THESE LINES ===');
-                
-                // Split into manageable chunks for logging
-                const base64Data = qrBase64.replace(/^data:image\/png;base64,/, '');
-                const chunkSize = 100;
-                
-                for (let i = 0; i < base64Data.length; i += chunkSize) {
-                    console.log(base64Data.substring(i, i + chunkSize));
-                }
-                
-                console.log('=== END QR CODE BASE64 ===');
-                console.log('\nInstructions:');
-                console.log('1. Copy ALL text between the lines above');
-                console.log('2. Go to https://base64.guru/converter/decode/image');
-                console.log('3. Paste the copied text into the input field');
-                console.log('4. Download the image and scan it with WhatsApp');
-                console.log('5. Or use any other base64 to image converter\n');
-                
-            } catch (err) {
-                console.log('Error generating QR code:', err);
-            }
+            console.log('\n\n=== WHATSAPP QR CODE ===');
+            console.log('1. Open WhatsApp on your phone');
+            console.log('2. Tap Menu (3 dots) → Linked Devices → Link a Device');
+            console.log('3. Scan the QR code below:\n');
         }
         
         if (connection === 'close') {
@@ -86,25 +61,4 @@ async function connectToWhatsApp() {
     });
 }
 
-// Install missing dependency and start
-function startBot() {
-    // Check if qrcode package is installed, if not install it
-    try {
-        require.resolve('qrcode');
-        console.log('QRCode package found. Starting bot...');
-        connectToWhatsApp().catch(err => console.log("Unexpected error: ", err));
-    } catch (e) {
-        console.log('QRCode package not found. Installing...');
-        const { execSync } = require('child_process');
-        try {
-            execSync('npm install qrcode', { stdio: 'inherit' });
-            console.log('QRCode package installed. Restarting...');
-            // Restart the bot
-            connectToWhatsApp().catch(err => console.log("Unexpected error: ", err));
-        } catch (installError) {
-            console.log('Failed to install QRCode package:', installError);
-        }
-    }
-}
-
-startBot();
+connectToWhatsApp().catch(err => console.log("Unexpected error: ", err));
