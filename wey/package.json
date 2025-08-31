@@ -12,6 +12,7 @@
   "author": "dafedescribe",
   "license": "ISC",
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.19"
+    "@whiskeysockets/baileys": "^6.7.19",
+    "qrcode": "^1.5.4"
   }
 }
