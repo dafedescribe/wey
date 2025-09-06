@@ -155,10 +155,15 @@ class WebServer {
     }
 
     start(port = process.env.PORT || 3000) {
-        this.server = this.app.listen(port, () => {
-            console.log(`🌐 Web server running on http://localhost:${port}`)
+        // Bind to 0.0.0.0 for cloud deployments like Render
+        const host = process.env.NODE_ENV === 'production' ? '0.0.0.0' : 'localhost'
+        
+        this.server = this.app.listen(port, host, () => {
+            console.log(`🌐 Web server running on ${host}:${port}`)
             console.log(`🔗 Ready to handle short link redirects`)
+            console.log(`📊 Environment: ${process.env.NODE_ENV || 'development'}`)
         })
+        
         return this.server
     }
 
