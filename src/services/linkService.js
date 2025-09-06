@@ -1,345 +1,295 @@
-const { supabase } = require('../config/database')
-const crypto = require('crypto')
-const urlRegex = require('url-regex')
+const express = require('express')
+const cors = require('cors')
+const helmet = require('helmet')
+const rateLimit = require('express-rate-limit')
+const LinkService = require('../services/linkService')
+const SecurityService = require('../services/securityService')
 
-class LinkService {
-    // Generate unique short code
-    static generateShortCode() {
-        return crypto.randomBytes(3).toString('base64url').slice(0, 6)
-    }
-
-    // Validate URL
-    static isValidUrl(string) {
-        return urlRegex({exact: true}).test(string)
-    }
-
-    // Extract domain from URL
-    static extractDomain(url) {
+class WebServer {
+    constructor() {
+        this.app = express()
+        
+        // Test LinkService import
         try {
-            return new URL(url).hostname
-        } catch {
-            return null
-        }
-    }
-
-    // Create or get user
-    static async createOrGetUser(phoneNumber, username = null, displayName = null) {
-        try {
-            // Check if user exists
-            const { data: existingUser } = await supabase
-                .from('users')
-                .select('*')
-                .eq('phone_number', phoneNumber)
-                .single()
-
-            if (existingUser) {
-                return existingUser
-            }
-
-            // Create new user
-            const { data: newUser, error } = await supabase
-                .from('users')
-                .insert([{
-                    phone_number: phoneNumber,
-                    username: username,
-                    display_name: displayName
-                }])
-                .select()
-                .single()
-
-            if (error) throw error
-            console.log(`👤 New user created: ${phoneNumber}`)
-            return newUser
+            console.log('🧪 Testing LinkService import...')
+            console.log('LinkService methods:', Object.getOwnPropertyNames(LinkService))
+            console.log('✅ LinkService imported successfully')
         } catch (error) {
-            console.error('❌ Error creating user:', error.message)
-            return null
+            console.error('❌ LinkService import failed:', error.message)
         }
+        
+        this.setupMiddleware()
+        this.setupRoutes()
     }
 
-    // Shorten URL
-    static async shortenUrl(originalUrl, phoneNumber, username = null, displayName = null) {
-        try {
-            // Validate URL
-            if (!this.isValidUrl(originalUrl)) {
-                throw new Error('Invalid URL format')
-            }
+    setupMiddleware() {
+        // Trust proxy FIRST - crucial for Render and other cloud platforms
+        this.app.set('trust proxy', true)
+        
+        // Security middleware
+        this.app.use(helmet())
+        this.app.use(cors())
+        
+        // Rate limiting
+        const limiter = rateLimit({
+            windowMs: 15 * 60 * 1000, // 15 minutes
+            max: 100 // limit each IP to 100 requests per windowMs
+        })
+        this.app.use(limiter)
 
-            // Get or create user
-            const user = await this.createOrGetUser(phoneNumber, username, displayName)
-            if (!user) throw new Error('Failed to create user')
+        // Body parsing
+        this.app.use(express.json())
+        this.app.use(express.urlencoded({ extended: true }))
 
-            // Generate unique short code
-            let shortCode
-            let isUnique = false
-            let attempts = 0
+        // Debug middleware to log all requests
+        this.app.use((req, res, next) => {
+            console.log(`📥 ${req.method} ${req.url} - IP: ${req.ip}`)
+            console.log(`📋 Headers:`, req.headers)
+            next()
+        })
+    }
 
-            while (!isUnique && attempts < 10) {
-                shortCode = this.generateShortCode()
-                
-                const { data: existing } = await supabase
-                    .from('shortened_links')
-                    .select('id')
-                    .eq('short_code', shortCode)
-                    .single()
+    setupRoutes() {
+        // Health check
+        this.app.get('/health', (req, res) => {
+            console.log('🏥 Health check requested')
+            res.json({ status: 'OK', timestamp: new Date().toISOString() })
+        })
 
-                if (!existing) isUnique = true
-                attempts++
-            }
-
-            if (!isUnique) throw new Error('Failed to generate unique short code')
-
-            // Create shortened link
-            const shortUrl = `${process.env.SHORT_DOMAIN || 'http://localhost:3000'}/${shortCode}`
-            const domain = this.extractDomain(originalUrl)
-
-            const { data: link, error } = await supabase
-                .from('shortened_links')
-                .insert([{
-                    user_id: user.id,
-                    original_url: originalUrl,
-                    short_code: shortCode,
-                    short_url: shortUrl,
-                    domain: domain
-                }])
-                .select()
-                .single()
-
-            if (error) throw error
-
-            // Update user's link count - FIXED: Use RPC or manual increment
-            const { error: updateError } = await supabase
-                .rpc('increment_user_links', { user_id: user.id })
-
-            // If RPC doesn't exist, fall back to manual increment
-            if (updateError) {
-                console.log('⚠️ RPC not available, using manual increment')
-                const { error: manualError } = await supabase
-                    .from('users')
-                    .update({ 
-                        total_links_created: user.total_links_created + 1,
-                        updated_at: new Date().toISOString()
-                    })
-                    .eq('id', user.id)
-                
-                if (manualError) {
-                    console.error('⚠️ Failed to update user link count:', manualError.message)
+        // Redirect route - handles short URL clicks
+        this.app.get('/:shortCode', async (req, res) => {
+            const { shortCode } = req.params
+            console.log(`🔍 Redirect requested for shortCode: ${shortCode}`)
+            
+            try {
+                // Check if LinkService exists and has the method
+                if (!LinkService || typeof LinkService.getLinkByShortCode !== 'function') {
+                    console.error('❌ LinkService.getLinkByShortCode is not available')
+                    return res.status(500).send('Service unavailable')
                 }
-            }
 
-            console.log(`🔗 Link shortened: ${originalUrl} -> ${shortUrl}`)
-            return link
-        } catch (error) {
-            console.error('❌ Error shortening URL:', error.message)
-            throw error
-        }
-    }
+                console.log('🔄 Looking up link in database...')
+                const link = await LinkService.getLinkByShortCode(shortCode)
+                console.log('📊 Database result:', link ? 'Found' : 'Not found')
+                
+                if (link) {
+                    console.log('🔗 Link details:', {
+                        id: link.id,
+                        original_url: link.original_url,
+                        short_code: link.short_code
+                    })
+                }
 
-    // Get link by short code
-    static async getLinkByShortCode(shortCode) {
-        try {
-            console.log(`🔍 Looking up shortCode: ${shortCode}`)
-            
-            const { data, error } = await supabase
-                .from('shortened_links')
-                .select(`
-                    *,
-                    users (
-                        phone_number,
-                        username,
-                        display_name
-                    )
-                `)
-                .eq('short_code', shortCode)
-                .eq('is_active', true)
-                .single()
+                if (!link) {
+                    console.log('❌ Link not found, showing 404 page')
+                    return res.status(404).send(`
+                        <html>
+                            <head><title>Link Not Found</title></head>
+                            <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+                                <h1>🔍 Link Not Found</h1>
+                                <p>The short link "${shortCode}" doesn't exist or has expired.</p>
+                                <a href="https://wa.me/YOUR_BOT_NUMBER" style="color: #25D366;">Create a short link with our WhatsApp bot</a>
+                                <hr>
+                                <p><small>Debug: Searched for "${shortCode}"</small></p>
+                            </body>
+                        </html>
+                    `)
+                }
 
-            if (error && error.code !== 'PGRST116') {
-                console.error('❌ Database error:', error)
-                throw error
-            }
-            
-            console.log(`📊 Link lookup result: ${data ? 'Found' : 'Not found'}`)
-            if (data) {
-                console.log(`🔗 Original URL: ${data.original_url}`)
-            }
-            
-            return data
-        } catch (error) {
-            console.error('❌ Error getting link:', error.message)
-            return null
-        }
-    }
+                // Validate the original URL
+                if (!link.original_url) {
+                    console.error('❌ Link has no original_url')
+                    return res.status(500).send('Invalid link data')
+                }
 
-    // Track click - FIXED: No more supabase.raw()
-    static async trackClick(linkId, ipAddress, userAgent, referrer = null) {
-        try {
-            console.log(`📊 Tracking click for link ${linkId}`)
-            
-            // Check if this IP has clicked this link before (for unique tracking)
-            const { data: existingClick } = await supabase
-                .from('link_clicks')
-                .select('id')
-                .eq('link_id', linkId)
-                .eq('ip_address', ipAddress)
-                .single()
+                // Clean and validate the URL
+                let redirectUrl = link.original_url.trim()
+                
+                // Ensure URL has protocol - be more careful about this
+                if (!redirectUrl.match(/^https?:\/\//i)) {
+                    redirectUrl = 'https://' + redirectUrl
+                    console.log(`🔧 Added https:// to URL: ${redirectUrl}`)
+                }
 
-            const isUnique = !existingClick
-            console.log(`👤 Click is ${isUnique ? 'unique' : 'repeat'} for IP: ${ipAddress}`)
+                // Validate the final URL format
+                try {
+                    new URL(redirectUrl) // This will throw if invalid
+                    console.log(`🎯 Validated redirect URL: ${redirectUrl}`)
+                } catch (urlError) {
+                    console.error('❌ Invalid URL format:', redirectUrl)
+                    return res.status(400).send('Invalid URL format in database')
+                }
 
-            // Parse user agent for device info
-            const deviceType = this.parseDeviceType(userAgent)
-            const browser = this.parseBrowser(userAgent)
+                // Track the click BEFORE redirect (important!)
+                try {
+                    const clientIP = req.ip || req.connection.remoteAddress || 'unknown'
+                    const userAgent = req.get('User-Agent') || 'unknown'
+                    const referrer = req.get('Referer') || null
 
-            // Insert click record
-            const { error: clickError } = await supabase
-                .from('link_clicks')
-                .insert([{
-                    link_id: linkId,
-                    ip_address: ipAddress,
-                    user_agent: userAgent,
-                    referrer: referrer,
-                    device_type: deviceType,
-                    browser: browser,
-                    is_unique: isUnique
-                }])
+                    console.log('📊 Tracking click:', { clientIP, userAgent: userAgent.substring(0, 50) + '...' })
+                    
+                    if (LinkService.trackClick && typeof LinkService.trackClick === 'function') {
+                        await LinkService.trackClick(link.id, clientIP, userAgent, referrer)
+                        console.log('✅ Click tracked successfully')
+                    } else {
+                        console.log('⚠️ LinkService.trackClick not available')
+                    }
+                } catch (trackError) {
+                    console.error('⚠️ Click tracking failed:', trackError.message)
+                    // Continue with redirect even if tracking fails
+                }
 
-            if (clickError) throw clickError
-
-            // Update link statistics - FIXED: Manual increment instead of raw()
-            // First get current counts
-            const { data: currentLink, error: fetchError } = await supabase
-                .from('shortened_links')
-                .select('total_clicks, unique_clicks')
-                .eq('id', linkId)
-                .single()
-
-            if (fetchError) throw fetchError
-
-            // Calculate new counts
-            const newTotalClicks = (currentLink.total_clicks || 0) + 1
-            const newUniqueClicks = isUnique ? (currentLink.unique_clicks || 0) + 1 : currentLink.unique_clicks
-
-            // Update with new counts
-            const { error: updateError } = await supabase
-                .from('shortened_links')
-                .update({
-                    total_clicks: newTotalClicks,
-                    unique_clicks: newUniqueClicks
+                // Perform the redirect with proper headers
+                console.log(`🚀 Executing redirect to: ${redirectUrl}`)
+                
+                // Set proper headers for redirect
+                res.writeHead(302, {
+                    'Location': redirectUrl,
+                    'Cache-Control': 'no-cache, no-store, must-revalidate',
+                    'Pragma': 'no-cache',
+                    'Expires': '0'
                 })
-                .eq('id', linkId)
+                res.end()
+                
+                console.log('✅ Manual redirect sent with headers')
 
-            if (updateError) throw updateError
-
-            console.log(`📊 Click tracked successfully - Total: ${newTotalClicks}, Unique: ${newUniqueClicks}`)
-            return { success: true, isUnique }
-        } catch (error) {
-            console.error('❌ Error tracking click:', error.message)
-            return { success: false, isUnique: false }
-        }
-    }
-
-    // Simple device type detection
-    static parseDeviceType(userAgent) {
-        const ua = userAgent.toLowerCase()
-        if (ua.includes('mobile') || ua.includes('android') || ua.includes('iphone')) {
-            return 'mobile'
-        } else if (ua.includes('tablet') || ua.includes('ipad')) {
-            return 'tablet'
-        }
-        return 'desktop'
-    }
-
-    // Simple browser detection
-    static parseBrowser(userAgent) {
-        const ua = userAgent.toLowerCase()
-        if (ua.includes('chrome')) return 'Chrome'
-        if (ua.includes('firefox')) return 'Firefox'
-        if (ua.includes('safari')) return 'Safari'
-        if (ua.includes('edge')) return 'Edge'
-        return 'Unknown'
-    }
-
-    // Get user's links
-    static async getUserLinks(phoneNumber) {
-        try {
-            const { data, error } = await supabase
-                .from('users')
-                .select(`
-                    *,
-                    shortened_links (
-                        id,
-                        original_url,
-                        short_url,
-                        total_clicks,
-                        unique_clicks,
-                        created_at
-                    )
+            } catch (error) {
+                console.error('❌ Redirect error:', error)
+                console.error('📊 Error details:', {
+                    message: error.message,
+                    stack: error.stack?.split('\n').slice(0, 5)
+                })
+                res.status(500).send(`
+                    <html>
+                        <head><title>Server Error</title></head>
+                        <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+                            <h1>❌ Server Error</h1>
+                            <p>Something went wrong while processing your request.</p>
+                            <p><small>Error: ${error.message}</small></p>
+                        </body>
+                    </html>
                 `)
-                .eq('phone_number', phoneNumber)
-                .single()
-
-            if (error && error.code !== 'PGRST116') throw error
-            return data
-        } catch (error) {
-            console.error('❌ Error getting user links:', error.message)
-            return null
-        }
-    }
-
-    // Get link statistics
-    static async getLinkStats(shortCode) {
-        try {
-            const { data: link } = await supabase
-                .from('shortened_links')
-                .select(`
-                    *,
-                    link_clicks (
-                        clicked_at,
-                        device_type,
-                        browser,
-                        is_unique
-                    )
-                `)
-                .eq('short_code', shortCode)
-                .single()
-
-            if (!link) return null
-
-            // Process click data
-            const clicks = link.link_clicks || []
-            const today = new Date()
-            const todayClicks = clicks.filter(click => {
-                const clickDate = new Date(click.clicked_at)
-                return clickDate.toDateString() === today.toDateString()
-            })
-
-            return {
-                ...link,
-                todayClicks: todayClicks.length,
-                deviceBreakdown: this.getDeviceBreakdown(clicks),
-                browserBreakdown: this.getBrowserBreakdown(clicks)
             }
-        } catch (error) {
-            console.error('❌ Error getting link stats:', error.message)
-            return null
+        })
+
+        // API route to get link statistics
+        this.app.get('/api/stats/:shortCode', async (req, res) => {
+            try {
+                const { shortCode } = req.params
+                console.log(`📊 Stats requested for: ${shortCode}`)
+                
+                const stats = await LinkService.getLinkStats(shortCode)
+
+                if (!stats) {
+                    return res.status(404).json({ error: 'Link not found' })
+                }
+
+                // Don't expose sensitive data
+                const publicStats = {
+                    shortCode: stats.short_code,
+                    shortUrl: stats.short_url,
+                    totalClicks: stats.total_clicks,
+                    uniqueClicks: stats.unique_clicks,
+                    todayClicks: stats.todayClicks,
+                    createdAt: stats.created_at,
+                    deviceBreakdown: stats.deviceBreakdown,
+                    browserBreakdown: stats.browserBreakdown
+                }
+
+                res.json(publicStats)
+            } catch (error) {
+                console.error('❌ Stats API error:', error)
+                res.status(500).json({ error: 'Internal Server Error' })
+            }
+        })
+
+        // Preview route (optional - shows link info without redirecting)
+        this.app.get('/preview/:shortCode', async (req, res) => {
+            try {
+                const { shortCode } = req.params
+                console.log(`👀 Preview requested for: ${shortCode}`)
+                
+                const link = await LinkService.getLinkByShortCode(shortCode)
+
+                if (!link) {
+                    return res.status(404).send('Link not found')
+                }
+
+                res.send(`
+                    <html>
+                        <head>
+                            <title>Link Preview</title>
+                            <style>
+                                body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
+                                .card { border: 1px solid #ddd; border-radius: 8px; padding: 20px; background: #f9f9f9; }
+                                .stats { display: flex; gap: 20px; margin: 20px 0; }
+                                .stat { text-align: center; }
+                                .continue-btn { background: #25D366; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; }
+                                .original-url { word-break: break-all; color: #666; }
+                                .debug { background: #f0f0f0; padding: 10px; font-size: 12px; margin-top: 20px; }
+                            </style>
+                        </head>
+                        <body>
+                            <div class="card">
+                                <h1>🔗 Link Preview</h1>
+                                <p><strong>Short URL:</strong> ${link.short_url}</p>
+                                <p><strong>Original URL:</strong> <span class="original-url">${link.original_url}</span></p>
+                                
+                                <div class="stats">
+                                    <div class="stat">
+                                        <h3>${link.total_clicks || 0}</h3>
+                                        <p>Total Clicks</p>
+                                    </div>
+                                    <div class="stat">
+                                        <h3>${link.unique_clicks || 0}</h3>
+                                        <p>Unique Clicks</p>
+                                    </div>
+                                </div>
+                                
+                                <p>
+                                    <a href="/${shortCode}" class="continue-btn">Continue to Original Link</a>
+                                </p>
+                                
+                                <p><small>Created: ${new Date(link.created_at).toLocaleDateString()}</small></p>
+                                
+                                <div class="debug">
+                                    <strong>Debug Info:</strong><br>
+                                    Short Code: ${shortCode}<br>
+                                    Link ID: ${link.id}<br>
+                                    Has Original URL: ${!!link.original_url}
+                                </div>
+                            </div>
+                        </body>
+                    </html>
+                `)
+            } catch (error) {
+                console.error('❌ Preview error:', error)
+                res.status(500).send('Internal Server Error')
+            }
+        })
+
+        // Catch-all route for debugging - REMOVED THE PROBLEMATIC * ROUTE
+    }
+
+    start(port = process.env.PORT || 3000) {
+        const host = process.env.NODE_ENV === 'production' ? '0.0.0.0' : 'localhost'
+        
+        this.server = this.app.listen(port, host, () => {
+            console.log(`🌐 Web server running on ${host}:${port}`)
+            console.log(`🔗 Ready to handle short link redirects`)
+            console.log(`📊 Environment: ${process.env.NODE_ENV || 'development'}`)
+            console.log(`🛠️  Debug mode enabled - check logs for detailed info`)
+        })
+        
+        return this.server
+    }
+
+    stop() {
+        if (this.server) {
+            this.server.close()
+            console.log('🛑 Web server stopped')
         }
-    }
-
-    static getDeviceBreakdown(clicks) {
-        const breakdown = {}
-        clicks.forEach(click => {
-            breakdown[click.device_type] = (breakdown[click.device_type] || 0) + 1
-        })
-        return breakdown
-    }
-
-    static getBrowserBreakdown(clicks) {
-        const breakdown = {}
-        clicks.forEach(click => {
-            breakdown[click.browser] = (breakdown[click.browser] || 0) + 1
-        })
-        return breakdown
     }
 }
 
-module.exports = LinkService
+module.exports = WebServer
