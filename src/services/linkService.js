@@ -106,14 +106,25 @@ class LinkService {
 
             if (error) throw error
 
-            // Update user's link count
-            await supabase
-                .from('users')
-                .update({ 
-                    total_links_created: user.total_links_created + 1,
-                    updated_at: new Date().toISOString()
-                })
-                .eq('id', user.id)
+            // Update user's link count - FIXED: Use RPC or manual increment
+            const { error: updateError } = await supabase
+                .rpc('increment_user_links', { user_id: user.id })
+
+            // If RPC doesn't exist, fall back to manual increment
+            if (updateError) {
+                console.log('⚠️ RPC not available, using manual increment')
+                const { error: manualError } = await supabase
+                    .from('users')
+                    .update({ 
+                        total_links_created: user.total_links_created + 1,
+                        updated_at: new Date().toISOString()
+                    })
+                    .eq('id', user.id)
+                
+                if (manualError) {
+                    console.error('⚠️ Failed to update user link count:', manualError.message)
+                }
+            }
 
             console.log(`🔗 Link shortened: ${originalUrl} -> ${shortUrl}`)
             return link
@@ -126,6 +137,8 @@ class LinkService {
     // Get link by short code
     static async getLinkByShortCode(shortCode) {
         try {
+            console.log(`🔍 Looking up shortCode: ${shortCode}`)
+            
             const { data, error } = await supabase
                 .from('shortened_links')
                 .select(`
@@ -140,7 +153,16 @@ class LinkService {
                 .eq('is_active', true)
                 .single()
 
-            if (error && error.code !== 'PGRST116') throw error
+            if (error && error.code !== 'PGRST116') {
+                console.error('❌ Database error:', error)
+                throw error
+            }
+            
+            console.log(`📊 Link lookup result: ${data ? 'Found' : 'Not found'}`)
+            if (data) {
+                console.log(`🔗 Original URL: ${data.original_url}`)
+            }
+            
             return data
         } catch (error) {
             console.error('❌ Error getting link:', error.message)
@@ -148,9 +170,11 @@ class LinkService {
         }
     }
 
-    // Track click
+    // Track click - FIXED: No more supabase.raw()
     static async trackClick(linkId, ipAddress, userAgent, referrer = null) {
         try {
+            console.log(`📊 Tracking click for link ${linkId}`)
+            
             // Check if this IP has clicked this link before (for unique tracking)
             const { data: existingClick } = await supabase
                 .from('link_clicks')
@@ -160,6 +184,7 @@ class LinkService {
                 .single()
 
             const isUnique = !existingClick
+            console.log(`👤 Click is ${isUnique ? 'unique' : 'repeat'} for IP: ${ipAddress}`)
 
             // Parse user agent for device info
             const deviceType = this.parseDeviceType(userAgent)
@@ -180,20 +205,32 @@ class LinkService {
 
             if (clickError) throw clickError
 
-            // Update link statistics
-            const updateData = { total_clicks: supabase.raw('total_clicks + 1') }
-            if (isUnique) {
-                updateData.unique_clicks = supabase.raw('unique_clicks + 1')
-            }
+            // Update link statistics - FIXED: Manual increment instead of raw()
+            // First get current counts
+            const { data: currentLink, error: fetchError } = await supabase
+                .from('shortened_links')
+                .select('total_clicks, unique_clicks')
+                .eq('id', linkId)
+                .single()
 
+            if (fetchError) throw fetchError
+
+            // Calculate new counts
+            const newTotalClicks = (currentLink.total_clicks || 0) + 1
+            const newUniqueClicks = isUnique ? (currentLink.unique_clicks || 0) + 1 : currentLink.unique_clicks
+
+            // Update with new counts
             const { error: updateError } = await supabase
                 .from('shortened_links')
-                .update(updateData)
+                .update({
+                    total_clicks: newTotalClicks,
+                    unique_clicks: newUniqueClicks
+                })
                 .eq('id', linkId)
 
             if (updateError) throw updateError
 
-            console.log(`📊 Click tracked for link ${linkId} (unique: ${isUnique})`)
+            console.log(`📊 Click tracked successfully - Total: ${newTotalClicks}, Unique: ${newUniqueClicks}`)
             return { success: true, isUnique }
         } catch (error) {
             console.error('❌ Error tracking click:', error.message)
